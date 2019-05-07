@@ -222,29 +222,11 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
             )
 
         program_uuid = kwargs['program_uuid']
-        student_data = OrderedDict((
-            row.get('external_user_key'),
-            {
-                'program_uuid': program_uuid,
-                'curriculum_uuid': row.get('curriculum_uuid'),
-                'status': row.get('status'),
-                'external_user_key': row.get('external_user_key'),
-            })
-            for row in request.data
-        )
-
-        key_counter = Counter([enrollment.get('external_user_key') for enrollment in request.data])
+        student_data = self._request_data_by_student_key(request, program_uuid)
 
         response_data = {}
-        for student_key, count in key_counter.items():
-            if count > 1:
-                response_data[student_key] = CourseEnrollmentResponseStatuses.DUPLICATED
-                student_data.pop(student_key)
-
-        existing_enrollments = ProgramEnrollment.bulk_read_by_student_key(program_uuid, student_data)
-        for enrollment in existing_enrollments:
-            response_data[enrollment.external_user_key] = CourseEnrollmentResponseStatuses.CONFLICT
-            student_data.pop(enrollment.external_user_key)
+        response_data.update(self._remove_duplicate_entries(request, student_data))
+        response_data.update(self._remove_existing_entries(program_uuid, student_data))
 
         enrollments_to_create = {}
 
@@ -258,10 +240,7 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
             serializer = ProgramEnrollmentSerializer(data=data)
             if serializer.is_valid():
                 enrollments_to_create[(student_key, curriculum_uuid)] = serializer
-                if not existing_user:
-                    response_data[student_key] = data.get('status') + '-waiting'
-                else: 
-                    response_data[student_key] = data.get('status')
+                response_data[student_key] = data.get('status')
             else:
                 if 'status' in serializer.errors and serializer.errors['status'][0].code == 'invalid_choice':
                     response_data[student_key] = CourseEnrollmentResponseStatuses.INVALID_STATUS
@@ -271,30 +250,11 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
                         status.HTTP_422_UNPROCESSABLE_ENTITY
                     )
 
-        for enrollment_serializer in enrollments_to_create.values():
-            # create the model
+        # TODO: make this a bulk save - https://openedx.atlassian.net/browse/EDUCATOR-4305
+        for (student_key, _), enrollment_serializer in enrollments_to_create.items():
             enrollment_serializer.save()
-            # TODO: make this a bulk save
 
-        if not enrollments_to_create:
-            return Response(
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                data=response_data,
-                content_type='application/json',
-            )
-
-        if len(request.data) != len(enrollments_to_create):
-            return Response(
-                status=status.HTTP_207_MULTI_STATUS,
-                data=response_data,
-                content_type='application/json',
-            )
-
-        return Response(
-            status=status.HTTP_201_CREATED,
-            data=response_data,
-            content_type='application/json',
-        )
+        return self._get_created_or_updated_response(request, enrollments_to_create, response_data)
 
     def patch(self, request, *args, **kwargs):
         if len(request.data) > 25:
@@ -304,26 +264,84 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
             )
 
         program_uuid = kwargs['program_uuid']
-        enrollment = ProgramEnrollment.objects.get(external_user_key=request.data['student_key'], program_uuid=program_uuid)
+        student_data = self._request_data_by_student_key(request, program_uuid)
 
-        data = {
-            'status': request.data['status'],
+        response_data = {}
+        response_data.update(self._remove_duplicate_entries(request, student_data))
+
+        existing_enrollments = {
+            enrollment.external_user_key: enrollment
+            for enrollment in
+            ProgramEnrollment.bulk_read_by_student_key(program_uuid, student_data)
         }
-        
-        enrollment_serializer = ProgramEnrollmentSerializer(enrollment, data=data, partial=True)
-        if enrollment_serializer.is_valid():
-            enrollment_serializer.save()
-            return Response(
-                status=status.HTTP_200_OK,
-                data='ok',
-                content_type='application/json',
-            )
-        else:
-            return Response(
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                data='bad',
-                content_type='application/json',
-            )
+
+        for external_user_key in student_data.keys():
+            if external_user_key not in existing_enrollments:
+                student_data.pop(external_user_key)
+                response_data[external_user_key] = CourseEnrollmentResponseStatuses.NOT_IN_PROGRAM
+
+        for external_user_key, enrollment in existing_enrollments.items():
+            data = {key: value for key, value in student_data[external_user_key].items() if key == 'status'}
+            enrollment_serializer = ProgramEnrollmentSerializer(enrollment, data=data, partial=True)
+            if enrollment_serializer.is_valid():
+                enrollment_serializer.save()
+                response_data[external_user_key] = data['status']
+
+        return self._get_created_or_updated_response(request, existing_enrollments, response_data, status.HTTP_200_OK)
+
+    def _remove_duplicate_entries(self, request, student_data):
+        """ Helper method to remove duplicate entries (based on student key) from request data. """
+        result = {}
+        key_counter = Counter([enrollment.get('external_user_key') for enrollment in request.data])
+        for student_key, count in key_counter.items():
+            if count > 1:
+                result[student_key] = CourseEnrollmentResponseStatuses.DUPLICATED
+                student_data.pop(student_key)
+        return result
+
+    def _request_data_by_student_key(self, request, program_uuid):
+        """
+        Helper method that returns an OrderedDict of rows from request.data,
+        keyed by the `external_user_key`.
+        """
+        return OrderedDict((
+            row.get('external_user_key'),
+            {
+                'program_uuid': program_uuid,
+                'curriculum_uuid': row.get('curriculum_uuid'),
+                'status': row.get('status'),
+                'external_user_key': row.get('external_user_key'),
+            })
+            for row in request.data
+        )
+
+    def _remove_existing_entries(self, program_uuid, student_data):
+        """ Helper method to remove entries that have existing ProgramEnrollment records. """
+        result = {}
+        existing_enrollments = ProgramEnrollment.bulk_read_by_student_key(program_uuid, student_data)
+        for enrollment in existing_enrollments:
+            result[enrollment.external_user_key] = CourseEnrollmentResponseStatuses.CONFLICT
+            student_data.pop(enrollment.external_user_key)
+        return result
+
+    def _get_created_or_updated_response(
+            self, request, created_or_updated_data, response_data, default_status=status.HTTP_201_CREATED
+    ):
+        """
+        Helper method to determine an appropirate HTTP response status code.
+        """
+        response_status = default_status
+
+        if not created_or_updated_data:
+            response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+        elif len(request.data) != len(created_or_updated_data):
+            response_status = status.HTTP_207_MULTI_STATUS
+
+        return Response(
+            status=response_status,
+            data=response_data,
+            content_type='application/json',
+        )
 
 
 class ProgramSpecificViewMixin(object):
