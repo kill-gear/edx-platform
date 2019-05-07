@@ -18,7 +18,10 @@ from rest_framework.test import APITestCase
 from six import text_type
 
 from lms.djangoapps.courseware.tests.factories import GlobalStaffFactory
-from lms.djangoapps.program_enrollments.api.v1.constants import CourseEnrollmentResponseStatuses as CourseStatuses
+from lms.djangoapps.program_enrollments.api.v1.constants import (
+    CourseEnrollmentResponseStatuses as CourseStatuses,
+    REQUEST_STUDENT_KEY,
+)
 from lms.djangoapps.program_enrollments.models import ProgramCourseEnrollment, ProgramEnrollment
 from openedx.core.djangoapps.catalog.cache import PROGRAM_CACHE_KEY_TPL
 from openedx.core.djangoapps.catalog.tests.factories import (
@@ -572,10 +575,14 @@ class ProgramEnrollmentViewPostTests(APITestCase):
         global_staff = GlobalStaffFactory.create(username='global-staff', password='password')
         self.client.login(username=global_staff.username, password='password')
 
+    def tearDown(self):
+        super(ProgramEnrollmentViewPostTests, self).tearDown()
+        ProgramEnrollment.objects.all().delete()
+
     def student_enrollment(self, enrollment_status, external_user_key=None):
         return {
+            REQUEST_STUDENT_KEY: external_user_key or str(uuid4().hex[0:10]),
             'status': enrollment_status,
-            'external_user_key': external_user_key or str(uuid4().hex[0:10]),
             'curriculum_uuid': str(uuid4())
         }
 
@@ -588,7 +595,7 @@ class ProgramEnrollmentViewPostTests(APITestCase):
         curriculum_uuids = [curriculum_uuid, curriculum_uuid, uuid4()]
         post_data = [
             {
-                'external_user_key': e,
+                REQUEST_STUDENT_KEY: e,
                 'status': s,
                 'curriculum_uuid': str(c)
             }
@@ -622,7 +629,7 @@ class ProgramEnrollmentViewPostTests(APITestCase):
         post_data = [
             {
                 'status': 'enrolled',
-                'external_user_key': 'abc1',
+                REQUEST_STUDENT_KEY: 'abc1',
                 'curriculum_uuid': str(curriculum_uuid)
             }
         ]
@@ -641,7 +648,7 @@ class ProgramEnrollmentViewPostTests(APITestCase):
 
         self.assertEqual(response.status_code, 201)
 
-        enrollment = ProgramEnrollment.objects.first()
+        enrollment = ProgramEnrollment.objects.get(external_user_key='abc1')
 
         self.assertEqual(enrollment.external_user_key, 'abc1')
         self.assertEqual(enrollment.program_uuid, program_key)
@@ -785,52 +792,54 @@ class ProgramEnrollmentViewPatchTests(APITestCase):
         self.password = 'password'
         self.student = UserFactory.create(username='student', password=self.password)
         self.global_staff = GlobalStaffFactory.create(username='global-staff', password=self.password)
-        
+
         self.client.login(username=self.global_staff.username, password=self.password)
-    
+
     def student_enrollment(self, enrollment_status, external_user_key=None):
         return {
             'status': enrollment_status,
-            'external_user_key': external_user_key or str(uuid4().hex[0:10]),
+            REQUEST_STUDENT_KEY: external_user_key or str(uuid4().hex[0:10]),
         }
-    
+
     def test_successfully_patched_program_enrollment(self):
+        enrollments = {}
         for i in xrange(4):
             user_key = 'user-{}'.format(i)
-            ProgramEnrollment.objects.create(
+            instance = ProgramEnrollment.objects.create(
                 program_uuid=self.program_uuid,
                 curriculum_uuid=self.curriculum_uuid,
                 user=None,
                 status='pending',
                 external_user_key=user_key,
             )
-        
-        post_data = [{
-            "student_key": "user-1",
-            "status": "withdrawn" 
-        },{
-            "student_key": "user-2",
-            "status": "suspended" 
-        },{
-            "student_key": "user-3",
-            "status": "enrolled" 
-        }]
-        user_1 = ProgramEnrollment.objects.get(external_user_key='user-1')
-        user_2 = ProgramEnrollment.objects.get(external_user_key='user-2')
-        user_3 = ProgramEnrollment.objects.get(external_user_key='user-3')
+            enrollments[user_key] = instance
 
-        self.assertEqual(user_1.status, 'pending')
-        self.assertEqual(user_2.status, 'pending')
-        self.assertEqual(user_3.status, 'pending')
+        post_data = [
+            {REQUEST_STUDENT_KEY: 'user-1', 'status': 'withdrawn'},
+            {REQUEST_STUDENT_KEY: 'user-2', 'status': 'suspended'},
+            {REQUEST_STUDENT_KEY: 'user-3', 'status': 'enrolled'},
+        ]
 
         url = reverse('programs_api:v1:program_enrollments', args=[self.program_uuid])
+
         response = self.client.patch(url, json.dumps(post_data), content_type='application/json')
 
-        user_1.refresh_from_db()
-        user_2.refresh_from_db()
-        user_3.refresh_from_db()
+        for enrollment in enrollments.values():
+            enrollment.refresh_from_db()
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(user_1.status, 'withdrawn')
-        self.assertEqual(user_2.status, 'suspended')
-        self.assertEqual(user_3.status, 'enrolled')
+        expected_statuses = {
+            'user-0': 'pending',
+            'user-1': 'withdrawn',
+            'user-2': 'suspended',
+            'user-3': 'enrolled',
+        }
+        for user_key, enrollment in enrollments.items():
+            assert expected_statuses[user_key] == enrollment.status
+
+        expected_response = {
+            'user-1': 'withdrawn',
+            'user-2': 'suspended',
+            'user-3': 'enrolled',
+        }
+        assert status.HTTP_200_OK  == response.status_code
+        assert expected_response == response.data

@@ -17,7 +17,11 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import CursorPagination
 from rest_framework.response import Response
 
-from lms.djangoapps.program_enrollments.api.v1.constants import CourseEnrollmentResponseStatuses, MAX_ENROLLMENT_RECORDS
+from lms.djangoapps.program_enrollments.api.v1.constants import (
+    CourseEnrollmentResponseStatuses,
+    MAX_ENROLLMENT_RECORDS,
+    REQUEST_STUDENT_KEY,
+)
 from lms.djangoapps.program_enrollments.api.v1.serializers import (
     ProgramCourseEnrollmentListSerializer,
     ProgramCourseEnrollmentRequestSerializer,
@@ -133,7 +137,7 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
         * The request body will be a list of one or more students to enroll with the following schema:
             {
                 'status': A choice of the following statuses: ['enrolled', 'pending', 'withdrawn', 'suspended'],
-                'external_user_key': string representation of a learner in partner systems,
+                student_key: string representation of a learner in partner systems,
                 'curriculum_uuid': string representation of a curriculum
             }
         Example:
@@ -292,7 +296,7 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
     def _remove_duplicate_entries(self, request, student_data):
         """ Helper method to remove duplicate entries (based on student key) from request data. """
         result = {}
-        key_counter = Counter([enrollment.get('external_user_key') for enrollment in request.data])
+        key_counter = Counter([enrollment.get(REQUEST_STUDENT_KEY) for enrollment in request.data])
         for student_key, count in key_counter.items():
             if count > 1:
                 result[student_key] = CourseEnrollmentResponseStatuses.DUPLICATED
@@ -305,12 +309,12 @@ class ProgramEnrollmentsView(DeveloperErrorViewMixin, PaginatedAPIView):
         keyed by the `external_user_key`.
         """
         return OrderedDict((
-            row.get('external_user_key'),
+            row.get(REQUEST_STUDENT_KEY),
             {
                 'program_uuid': program_uuid,
                 'curriculum_uuid': row.get('curriculum_uuid'),
                 'status': row.get('status'),
-                'external_user_key': row.get('external_user_key'),
+                REQUEST_STUDENT_KEY: row.get(REQUEST_STUDENT_KEY),
             })
             for row in request.data
         )
